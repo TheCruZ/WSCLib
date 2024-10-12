@@ -696,7 +696,7 @@ private:
 			status = NtQueryDirectoryObject(
 				hDir,
 				buffer.get(),
-				sizeof(buffSize),
+				buffSize,
 				FALSE,
 				FALSE,
 				&context,
@@ -779,17 +779,16 @@ private:
 		GetPrivilege(SE_RESTORE_NAME);
 
 
-		auto res = RegLoadKeyA(HKEY_LOCAL_MACHINE, "AmCacheTmp", "C:\\Windows\\appcompat\\Programs\\Amcache.hve");
+		auto res = RegLoadKeyW(HKEY_LOCAL_MACHINE, L"AmCacheTmp", L"C:\\Windows\\appcompat\\Programs\\Amcache.hve");
 		if (res != ERROR_SUCCESS) {
 
 			auto namedObjects = GetNamedObjects();
 
 			std::vector<DWORD> pids;
-
+			const std::wstring inventoryHandleName = L"InventorySynchronizationInventoryApplicationFileMemory";
 			for (auto& obj : namedObjects) {
-				//if start with InventorySynchronizationInventoryApplicationFileMemory
-				if (wcsstr(obj.c_str(), L"InventorySynchronizationInventoryApplicationFileMemory") != NULL) {
-					auto pid = wcstoul(obj.c_str() + wcslen(L"InventorySynchronizationInventoryApplicationFileMemory"), NULL, 10);
+				if (obj.find(inventoryHandleName) == 0) {
+					auto pid = wcstoul(obj.c_str() + inventoryHandleName.length(), NULL, 10);
 					pids.push_back(pid);
 				}
 			}
@@ -819,13 +818,12 @@ private:
 			}
 		}
 
-		auto lamdaRemoveSubkeysWithText = [](HKEY hKey, std::wstring text) {
+		auto lambdaRemoveSubkeysWithText = [](HKEY hKey, std::wstring text) {
 			auto subKeys = GetSubKeys(hKey);
 
 			for (auto& key : subKeys) {
 				std::transform(key.begin(), key.end(), key.begin(),
 					[](wchar_t c) { return std::towlower(c); });
-
 				if (key.find(text) != std::wstring::npos) {
 					if (RegDeleteKeyW(hKey, key.c_str()) != ERROR_SUCCESS) {
 						return false;
@@ -839,20 +837,21 @@ private:
 		bool result = true;
 
 		auto subkey = OpenKey(dup, L"InventoryApplicationFile");
-		auto deletionOk = lamdaRemoveSubkeysWithText(subkey, fileName);
+		auto deletionOk = lambdaRemoveSubkeysWithText(subkey, fileName);
 		RegCloseKey(subkey);
 		if (!deletionOk) result = false;
 
 		subkey = OpenKey(dup, L"InventoryApplicationShortcut");
-		deletionOk = lamdaRemoveSubkeysWithText(subkey, fileNameWithoutExtension);
+		deletionOk = lambdaRemoveSubkeysWithText(subkey, fileNameWithoutExtension);
 		RegCloseKey(subkey);
 		if (!deletionOk) result = false;
 
 		subkey = OpenKey(dup, L"InventoryNonArp");
-		deletionOk = lamdaRemoveSubkeysWithText(subkey, fileName);
+		deletionOk = lambdaRemoveSubkeysWithText(subkey, fileName);
 		RegCloseKey(subkey);
 		if (!deletionOk) result = false;
 
+		RegFlushKey(dup);
 		CloseHandle(dup);
 		if (manuallyLoaded) {
 			RegUnLoadKeyW(HKEY_LOCAL_MACHINE, L"AmCacheTmp");
