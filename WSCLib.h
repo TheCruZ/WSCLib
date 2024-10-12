@@ -16,6 +16,7 @@ This header is focused in forensic cleaning of execution traces of an applicatio
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <Subauth.h>
 
 
 class WSCLib
@@ -596,11 +597,273 @@ private:
 			NULL)) {
 
 			DWORD error = GetLastError();
-			std::cerr << "Failed to delete USN journal. Error code: " << error << std::endl;
 			return false;
 		}
 
 		return true;
+	}
+
+
+	static HKEY bruteHandle(HANDLE proc) {
+		auto uproc = GetCurrentProcess();
+		for (int i = 1; i < 0x10000; i++) {
+			HANDLE hDup;
+			if (DuplicateHandle(proc, (HKEY)i, uproc, &hDup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+				for (int i = 0;; i++) {
+					WCHAR name[255];
+					DWORD size = sizeof(name) / 2;
+					auto result = RegEnumKeyW((HKEY)hDup, i, name, size);
+					if (result != ERROR_SUCCESS) {
+						break;
+					}
+
+					if (wcscmp(name, L"InventoryApplicationFile") == 0) {
+						return (HKEY)hDup;
+					}
+				}
+
+				CloseHandle(hDup);
+			}
+		}
+
+		return 0;
+	}
+
+	static std::vector<std::wstring> GetNamedObjects() {
+
+		std::vector<std::wstring> namedObjects;
+
+		typedef struct _OBJECT_ATTRIBUTES {
+			ULONG           Length;
+			HANDLE          RootDirectory;
+			PUNICODE_STRING ObjectName;
+			ULONG           Attributes;
+			PVOID           SecurityDescriptor;
+			PVOID           SecurityQualityOfService;
+		} OBJECT_ATTRIBUTES, * POBJECT_ATTRIBUTES;
+
+		//NtOpenDirectoryObject
+		typedef NTSTATUS(__stdcall* NtOpenDirectoryObject_t)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+		//NtQueryDirectoryObject
+		typedef NTSTATUS(__stdcall* NtQueryDirectoryObject_t)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG);
+
+
+		auto ntdll = LoadLibraryA("ntdll.dll");
+		if (ntdll == NULL) {
+			throw std::exception("Error loading ntdll.dll");
+		}
+		auto NtOpenDirectoryObject = NtOpenDirectoryObject_t((ULONG64)GetProcAddress(ntdll, "NtOpenDirectoryObject"));
+		if (NtOpenDirectoryObject == NULL) {
+			throw std::exception("Error getting NtOpenDirectoryObject address");
+		}
+		auto NtQueryDirectoryObject = NtQueryDirectoryObject_t((ULONG64)GetProcAddress(ntdll, "NtQueryDirectoryObject"));
+		if (NtQueryDirectoryObject == NULL) {
+			throw std::exception("Error getting NtQueryDirectoryObject address");
+		}
+
+
+		OBJECT_ATTRIBUTES objAttr;
+		UNICODE_STRING objName;
+		wchar_t name[] = L"\\BaseNamedObjects";
+		objName.Buffer = name;
+		objName.Length = sizeof(name) - sizeof(WCHAR);
+		objName.MaximumLength = sizeof(name);
+
+
+		objAttr.Length = sizeof(OBJECT_ATTRIBUTES);
+		objAttr.RootDirectory = NULL;
+		objAttr.ObjectName = &objName;
+		objAttr.Attributes = 0;
+		objAttr.SecurityDescriptor = NULL;
+		objAttr.SecurityQualityOfService = NULL;
+
+#define DIRECTORY_QUERY 0x0001
+
+		HANDLE hDir;
+		auto status = NtOpenDirectoryObject(&hDir, DIRECTORY_QUERY, &objAttr);
+		if (status != 0) {
+			return {};
+		}
+
+		auto buffSize = 0x1000;
+		auto buffer = std::make_unique<BYTE[]>(buffSize);
+		ULONG context = 0;
+
+#define STATUS_NO_MORE_ENTRIES ((NTSTATUS)0x8000001A)
+
+		while (true) {
+			ULONG returnLength;
+			status = NtQueryDirectoryObject(
+				hDir,
+				buffer.get(),
+				sizeof(buffSize),
+				FALSE,
+				FALSE,
+				&context,
+				&returnLength);
+
+			if (status == STATUS_NO_MORE_ENTRIES) {
+				break;
+			}
+			else if (!NT_SUCCESS(status)) {
+				break;
+			}
+
+			// The buffer contains a list of OBJECT_DIRECTORY_INFORMATION
+			struct OBJECT_DIRECTORY_INFORMATION {
+				UNICODE_STRING Name;
+				UNICODE_STRING TypeName;
+			};
+
+			OBJECT_DIRECTORY_INFORMATION* entry = (OBJECT_DIRECTORY_INFORMATION*)buffer.get();
+
+			while (true) {
+				if (entry->Name.Length == 0) {
+					break;
+				}
+
+				// Convert UNICODE_STRING to std::wstring and add to the list
+				namedObjects.push_back(std::wstring(entry->Name.Buffer, entry->Name.Length / sizeof(WCHAR)));
+
+				// Move to the next entry
+				entry = (OBJECT_DIRECTORY_INFORMATION*)((PBYTE)entry + sizeof(OBJECT_DIRECTORY_INFORMATION));
+			}
+		}
+
+		typedef NTSTATUS(__stdcall* NtClose_t)(HANDLE);
+		auto NtClose = NtClose_t((ULONG64)GetProcAddress(ntdll, "NtClose"));
+		if (NtClose == NULL) {
+			throw std::exception("Error getting NtClose address");
+		}
+
+		// Close the directory handle
+		NtClose(hDir);
+
+		return namedObjects;
+	}
+
+	static bool GetPrivilege(const wchar_t* priv) {
+
+		LUID privDw;
+		if (!LookupPrivilegeValueW(NULL, priv, &privDw)) {
+			return false;
+		}
+
+		auto ntdll = LoadLibraryA("ntdll.dll");
+		if (ntdll == NULL) {
+			throw std::exception("Error loading ntdll.dll");
+		}
+
+		typedef NTSTATUS(__stdcall* RtlAdjustPrivilege_t)(ULONG, BOOLEAN, BOOLEAN, PBOOLEAN);
+		auto RtlAdjustPrivilege = RtlAdjustPrivilege_t((ULONG64)GetProcAddress(ntdll, "RtlAdjustPrivilege"));
+		if (RtlAdjustPrivilege == NULL) {
+			throw std::exception("Error getting RtlAdjustPrivilege address");
+		}
+
+		BOOLEAN enabled;
+		auto status = RtlAdjustPrivilege(privDw.LowPart, TRUE, FALSE, &enabled);
+		if (status != 0) {
+			return false;
+		}
+
+		return true;
+	}
+
+	static bool ClearAmCache(std::wstring fileName, std::wstring fileNameWithoutExtension) {
+
+		HANDLE proc = INVALID_HANDLE_VALUE;
+		HKEY dup = 0;
+		bool manuallyLoaded = false;
+
+		GetPrivilege(SE_BACKUP_NAME);
+		GetPrivilege(SE_RESTORE_NAME);
+
+
+		auto res = RegLoadKeyA(HKEY_LOCAL_MACHINE, "AmCacheTmp", "C:\\Windows\\appcompat\\Programs\\Amcache.hve");
+		if (res != ERROR_SUCCESS) {
+
+			auto namedObjects = GetNamedObjects();
+
+			std::vector<DWORD> pids;
+
+			for (auto& obj : namedObjects) {
+				//if start with InventorySynchronizationInventoryApplicationFileMemory
+				if (wcsstr(obj.c_str(), L"InventorySynchronizationInventoryApplicationFileMemory") != NULL) {
+					auto pid = wcstoul(obj.c_str() + wcslen(L"InventorySynchronizationInventoryApplicationFileMemory"), NULL, 10);
+					pids.push_back(pid);
+				}
+			}
+
+			for (auto pid : pids) {
+				proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+				dup = bruteHandle(proc);
+				if (dup == 0) {
+					CloseHandle(proc);
+					proc = INVALID_HANDLE_VALUE;
+					dup = 0;
+				}
+				else {
+					break;
+				}
+			}
+
+			if (dup == 0) {
+				return false;
+			}
+		}
+		else {
+			manuallyLoaded = true;
+			res = RegOpenKeyW(HKEY_LOCAL_MACHINE, L"AmCacheTmp\\Root", &dup);
+			if (res != ERROR_SUCCESS) {
+				return false;
+			}
+		}
+
+		auto lamdaRemoveSubkeysWithText = [](HKEY hKey, std::wstring text) {
+			auto subKeys = GetSubKeys(hKey);
+
+			for (auto& key : subKeys) {
+				std::transform(key.begin(), key.end(), key.begin(),
+					[](wchar_t c) { return std::towlower(c); });
+
+				if (key.find(text) != std::wstring::npos) {
+					if (RegDeleteKeyW(hKey, key.c_str()) != ERROR_SUCCESS) {
+						return false;
+					}
+				}
+			}
+
+			return true;
+		};
+
+		bool result = true;
+
+		auto subkey = OpenKey(dup, L"InventoryApplicationFile");
+		auto deletionOk = lamdaRemoveSubkeysWithText(subkey, fileName);
+		RegCloseKey(subkey);
+		if (!deletionOk) result = false;
+
+		subkey = OpenKey(dup, L"InventoryApplicationShortcut");
+		deletionOk = lamdaRemoveSubkeysWithText(subkey, fileNameWithoutExtension);
+		RegCloseKey(subkey);
+		if (!deletionOk) result = false;
+
+		subkey = OpenKey(dup, L"InventoryNonArp");
+		deletionOk = lamdaRemoveSubkeysWithText(subkey, fileName);
+		RegCloseKey(subkey);
+		if (!deletionOk) result = false;
+
+		CloseHandle(dup);
+		if (manuallyLoaded) {
+			RegUnLoadKeyW(HKEY_LOCAL_MACHINE, L"AmCacheTmp");
+		}
+		else {
+			if (proc != INVALID_HANDLE_VALUE) {
+				CloseHandle(proc);
+			}
+		}
+
+		return result;
 	}
 
 public:
@@ -622,8 +885,9 @@ public:
 
 		std::wstring FilePath = InputFilePath;
 		std::wstring FileName = FilePath;
-		std::wstring Extension = L"";
-		std::wstring ParentFolderName = L"";
+		std::wstring Extension{};
+		std::wstring ParentFolderName{};
+		std::wstring FileNameWithoutExtension{};
 
 		// Get the file name from the path
 		auto pos = FileName.find_last_of(L"\\");
@@ -639,6 +903,10 @@ public:
 		pos = FileName.find_last_of(L".");
 		if (pos != std::wstring::npos) {
 			Extension = FileName.substr(pos);
+			FileNameWithoutExtension = FileName.substr(0, pos);
+		}
+		else {
+			FileNameWithoutExtension = FileName;
 		}
 
 		// Get the parent folder name
@@ -681,10 +949,10 @@ public:
 			return false;
 		}
 
-		/*
-		TODO: SRUM contains exeuction traces and network traces of the app
-		TODO: Shellbags find parent folder name
-		*/
+		if (!ClearAmCache(FileName, FileNameWithoutExtension)) {
+			std::cout << "Error clearing AmCache" << std::endl;
+			return false;
+		}
 
 		if (!ClearPrefetch(FileName, SkipWaitPrefetch)) {
 			std::cout << "Error clearing Prefetch" << std::endl;

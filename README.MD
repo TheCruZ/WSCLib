@@ -11,7 +11,7 @@ This library is a single include header to clear recent execution traces
 - RecentDocs
 - Prefetch
 - USNJournal (Just full deletion, not arbitrary files)
-
+- Amcache
 
 ### TODO
 
@@ -22,3 +22,4 @@ This library is a single include header to clear recent execution traces
 - Mui Cache
 - Explorer FeatureUsage
 - Compatibility Assistant
+- Shimcache
