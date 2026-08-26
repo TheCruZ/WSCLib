@@ -17,6 +17,9 @@ This header is focused in forensic cleaning of execution traces of an applicatio
 #include <filesystem>
 #include <fstream>
 #include <Subauth.h>
+#include <cstdint>
+#include <cstring>
+#include <memory>
 
 
 class WSCLib
@@ -208,6 +211,122 @@ private:
 		return values;
 	}
 
+	static bool ContainsInsensitive(const BYTE* data, size_t size, const std::wstring& needle)
+	{
+		if (needle.empty()) return false;
+		for (size_t i = 0; i + needle.size() <= size; ++i)
+		{
+			bool match = true;
+			for (size_t j = 0; j < needle.size(); ++j)
+			{
+				if (std::towlower(static_cast<unsigned char>(data[i + j])) !=
+					std::towlower(needle[j])) { match = false; break; }
+			}
+			if (match) return true;
+		}
+		const size_t wideBytes = needle.size() * sizeof(wchar_t);
+		for (size_t i = 0; i + wideBytes <= size; ++i)
+		{
+			bool match = true;
+			for (size_t j = 0; j < needle.size(); ++j)
+			{
+				wchar_t current = 0;
+				std::memcpy(&current, data + i + j * sizeof(wchar_t), sizeof(current));
+				if (std::towlower(current) != std::towlower(needle[j])) { match = false; break; }
+			}
+			if (match) return true;
+		}
+		return false;
+	}
+
+	static bool MatchesAny(const BYTE* data, size_t size,
+		const std::vector<std::wstring>& needles)
+	{
+		for (const auto& needle : needles)
+			if (ContainsInsensitive(data, size, needle)) return true;
+		return false;
+	}
+
+	static bool MatchesAny(const std::wstring& text,
+		const std::vector<std::wstring>& needles)
+	{
+		auto lower = text;
+		std::transform(lower.begin(), lower.end(), lower.begin(),
+			[](wchar_t c) { return std::towlower(c); });
+		for (const auto& needle : needles)
+		{
+			auto lowerNeedle = needle;
+			std::transform(lowerNeedle.begin(), lowerNeedle.end(), lowerNeedle.begin(),
+				[](wchar_t c) { return std::towlower(c); });
+			if (!lowerNeedle.empty() && lower.find(lowerNeedle) != std::wstring::npos) return true;
+		}
+		return false;
+	}
+
+	static bool ClearRegistryValues(HKEY root, const std::vector<std::wstring>& paths,
+		const std::vector<std::wstring>& needles)
+	{
+		for (const auto& path : paths)
+		{
+			auto key = OpenKey(root, path);
+			if (key == INVALID_HANDLE_VALUE) continue;
+			for (const auto& value : GetValueList(key))
+			{
+				if (MatchesAny(value.Name, needles) ||
+					MatchesAny(value.Data.data(), value.Data.size(), needles))
+				{
+					if (RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+					{
+						RegCloseKey(key);
+						return false;
+					}
+				}
+			}
+			RegCloseKey(key);
+		}
+		return true;
+	}
+
+	static bool ReadBinaryFile(const std::filesystem::path& path, std::vector<BYTE>& data)
+	{
+		std::ifstream file(path, std::ios::binary | std::ios::ate);
+		if (!file) return false;
+		const auto length = file.tellg();
+		if (length < 0 || length > 64 * 1024 * 1024) return false;
+		data.resize(static_cast<size_t>(length));
+		file.seekg(0, std::ios::beg);
+		return data.empty() || !!file.read(reinterpret_cast<char*>(data.data()), data.size());
+	}
+
+	static bool ReplaceBinaryFile(const std::filesystem::path& path,
+		const std::vector<BYTE>& data)
+	{
+		auto temporary = path.parent_path() /
+			(L".wsclib-" + std::to_wstring(GetCurrentProcessId()) + L".tmp");
+		{
+			std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+			if (!output || (!data.empty() &&
+				!output.write(reinterpret_cast<const char*>(data.data()), data.size()))) return false;
+		}
+		if (!ReplaceFileW(path.c_str(), temporary.c_str(), nullptr,
+			REPLACEFILE_WRITE_THROUGH, nullptr, nullptr))
+		{
+			DeleteFileW(temporary.c_str());
+			return false;
+		}
+		return true;
+	}
+
+	static std::wstring Expand(const wchar_t* value)
+	{
+		const DWORD required = ExpandEnvironmentStringsW(value, nullptr, 0);
+		if (!required) return {};
+		std::wstring result(required, L'\0');
+		if (!ExpandEnvironmentStringsW(value, result.data(), required)) return {};
+		result.resize(required - 1);
+		return result;
+	}
+
 	static bool ClearUserAssist(std::wstring FileName)
 	{
 		//HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\
@@ -326,6 +445,243 @@ private:
 		}
 
 		return true;
+	}
+
+	static bool ClearMuiCache(const std::vector<std::wstring>& needles)
+	{
+		return ClearRegistryValues(HKEY_CURRENT_USER, {
+			L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache",
+			L"Software\\Microsoft\\Windows\\ShellNoRoam\\MUICache" }, needles);
+	}
+
+	static bool ClearFeatureUsage(const std::vector<std::wstring>& needles)
+	{
+		const std::wstring rootPath =
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FeatureUsage";
+		auto root = OpenKey(HKEY_CURRENT_USER, rootPath);
+		if (root == INVALID_HANDLE_VALUE) return true;
+		for (const auto& category : GetSubKeys(root))
+		{
+			auto key = OpenKey(root, category);
+			if (key == INVALID_HANDLE_VALUE) continue;
+			for (const auto& value : GetValueList(key))
+			{
+				if (MatchesAny(value.Name, needles) &&
+					RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+				{
+					RegCloseKey(key); RegCloseKey(root); return false;
+				}
+			}
+			RegCloseKey(key);
+		}
+		RegCloseKey(root);
+		return true;
+	}
+
+	static bool ClearBam(const std::vector<std::wstring>& needles)
+	{
+		const std::vector<std::wstring> roots = {
+			L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings",
+			L"SYSTEM\\CurrentControlSet\\Services\\bam\\UserSettings",
+			L"SYSTEM\\CurrentControlSet\\Services\\dam\\State\\UserSettings",
+			L"SYSTEM\\CurrentControlSet\\Services\\dam\\UserSettings" };
+		for (const auto& path : roots)
+		{
+			auto root = OpenKey(HKEY_LOCAL_MACHINE, path);
+			if (root == INVALID_HANDLE_VALUE) continue;
+			for (const auto& sid : GetSubKeys(root))
+			{
+				auto key = OpenKey(root, sid);
+				if (key == INVALID_HANDLE_VALUE) continue;
+				for (const auto& value : GetValueList(key))
+				{
+					if (MatchesAny(value.Name, needles) &&
+						RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+					{
+						RegCloseKey(key); RegCloseKey(root); return false;
+					}
+				}
+				RegCloseKey(key);
+			}
+			RegCloseKey(root);
+		}
+		return true;
+	}
+
+	static bool FilterDelimitedFile(const std::filesystem::path& path,
+		const std::vector<BYTE>& delimiter, const std::vector<std::wstring>& needles)
+	{
+		std::vector<BYTE> input;
+		if (!ReadBinaryFile(path, input)) return !std::filesystem::exists(path);
+		std::vector<BYTE> output;
+		output.reserve(input.size());
+		size_t start = 0;
+		bool changed = false;
+		while (start < input.size())
+		{
+			auto found = std::search(input.begin() + start, input.end(),
+				delimiter.begin(), delimiter.end());
+			const size_t end = static_cast<size_t>(found - input.begin());
+			const size_t next = found == input.end() ? input.size() : end + delimiter.size();
+			if (MatchesAny(input.data() + start, end - start, needles)) changed = true;
+			else
+			{
+				output.insert(output.end(), input.begin() + start, input.begin() + end);
+				if (found != input.end()) output.insert(output.end(), delimiter.begin(), delimiter.end());
+			}
+			start = next;
+		}
+		return !changed || ReplaceBinaryFile(path, output);
+	}
+
+	static bool ClearCompatibilityAssistant(const std::vector<std::wstring>& needles)
+	{
+		if (!ClearRegistryValues(HKEY_CURRENT_USER, {
+			L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store",
+			L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Persisted",
+			L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers" }, needles)) return false;
+		const auto root = Expand(L"%SystemRoot%");
+		if (root.empty()) return false;
+		const auto pca = std::filesystem::path(root) / L"appcompat" / L"pca";
+		return FilterDelimitedFile(pca / L"PcaAppLaunchDic.txt", { '\r', '\n' }, needles) &&
+			FilterDelimitedFile(pca / L"PcaGeneralDb0.txt", { '\n', 0 }, needles) &&
+			FilterDelimitedFile(pca / L"PcaGeneralDb1.txt", { '\n', 0 }, needles);
+	}
+
+	static bool RemoveMruIndex(HKEY key, DWORD index)
+	{
+		DWORD type = 0, size = 0;
+		if (RegQueryValueExW(key, L"MRUListEx", nullptr, &type, nullptr, &size) != ERROR_SUCCESS)
+			return true;
+		if (type != REG_BINARY || size % sizeof(DWORD)) return false;
+		std::vector<BYTE> data(size);
+		if (RegQueryValueExW(key, L"MRUListEx", nullptr, &type, data.data(), &size) != ERROR_SUCCESS)
+			return false;
+		std::vector<BYTE> filtered;
+		for (size_t i = 0; i < data.size(); i += sizeof(DWORD))
+		{
+			DWORD value = 0; std::memcpy(&value, data.data() + i, sizeof(value));
+			if (value != index) filtered.insert(filtered.end(), data.begin() + i, data.begin() + i + sizeof(DWORD));
+		}
+		return RegSetValueExW(key, L"MRUListEx", 0, REG_BINARY,
+			filtered.data(), static_cast<DWORD>(filtered.size())) == ERROR_SUCCESS;
+	}
+
+	static bool ClearShellBagKey(HKEY root, const std::vector<std::wstring>& needles, int depth)
+	{
+		if (depth > 64) return false;
+		for (const auto& child : GetSubKeys(root))
+		{
+			auto key = OpenKey(root, child);
+			if (key != INVALID_HANDLE_VALUE)
+			{
+				const bool ok = ClearShellBagKey(key, needles, depth + 1);
+				RegCloseKey(key);
+				if (!ok) return false;
+			}
+		}
+		for (const auto& value : GetValueList(root))
+		{
+			wchar_t* end = nullptr;
+			const auto index = wcstoul(value.Name.c_str(), &end, 10);
+			if (!value.Name.empty() && end && *end == 0 &&
+				MatchesAny(value.Data.data(), value.Data.size(), needles))
+			{
+				if (RegDeleteValueW(root, value.Name.c_str()) != ERROR_SUCCESS) return false;
+				const auto treeResult = RegDeleteTreeW(root, value.Name.c_str());
+				if (treeResult != ERROR_SUCCESS && treeResult != ERROR_FILE_NOT_FOUND) return false;
+				if (!RemoveMruIndex(root, index)) return false;
+			}
+		}
+		return true;
+	}
+
+	static bool ClearShellbags(const std::vector<std::wstring>& needles)
+	{
+		for (const auto& path : {
+			L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU",
+			L"Software\\Microsoft\\Windows\\Shell\\BagMRU" })
+		{
+			auto root = OpenKey(HKEY_CURRENT_USER, path);
+			if (root == INVALID_HANDLE_VALUE) continue;
+			const bool ok = ClearShellBagKey(root, needles, 0);
+			RegCloseKey(root);
+			if (!ok) return false;
+		}
+		return true;
+	}
+
+	static uint16_t U16(const BYTE* p) { uint16_t value; std::memcpy(&value, p, 2); return value; }
+	static uint32_t U32(const BYTE* p) { uint32_t value; std::memcpy(&value, p, 4); return value; }
+
+	static bool ClearNvidiaRecent(const std::vector<std::wstring>& needles)
+	{
+		const auto programData = Expand(L"%ProgramData%");
+		if (programData.empty()) return false;
+		const auto path = std::filesystem::path(programData) / L"NVIDIA Corporation" / L"Drs" / L"nvAppTimestamps";
+		std::vector<BYTE> input;
+		if (!ReadBinaryFile(path, input)) return !std::filesystem::exists(path);
+		if (input.size() < 2 || U16(input.data()) != 1) return false;
+		std::vector<BYTE> output(input.begin(), input.begin() + 2);
+		size_t offset = 2; bool changed = false;
+		while (offset < input.size())
+		{
+			if (std::all_of(input.begin() + offset, input.end(), [](BYTE b) { return b == 0; }))
+			{ output.insert(output.end(), input.begin() + offset, input.end()); break; }
+			if (input.size() - offset < 12) return false;
+			const auto type = U16(input.data() + offset);
+			const auto pathBytes = U16(input.data() + offset + 2);
+			if ((type != 1 && type != 2) || pathBytes < 2 || pathBytes % 2) return false;
+			const size_t end = offset + 4ULL + pathBytes + 8ULL;
+			if (end > input.size() || input[offset + 4 + pathBytes - 2] || input[offset + 4 + pathBytes - 1]) return false;
+			if (MatchesAny(input.data() + offset + 4, pathBytes - 2, needles)) changed = true;
+			else output.insert(output.end(), input.begin() + offset, input.begin() + end);
+			offset = end;
+		}
+		if (!changed) return true;
+		output.resize(input.size(), 0);
+		return ReplaceBinaryFile(path, output);
+	}
+
+	static bool ClearShimcache(const std::vector<std::wstring>& needles)
+	{
+		auto key = OpenKey(HKEY_LOCAL_MACHINE,
+			L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache");
+		if (key == INVALID_HANDLE_VALUE) return true;
+		DWORD type = 0, size = 0;
+		if (RegQueryValueExW(key, L"AppCompatCache", nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+			type != REG_BINARY || size > 16 * 1024 * 1024) { RegCloseKey(key); return false; }
+		std::vector<BYTE> input(size);
+		if (RegQueryValueExW(key, L"AppCompatCache", nullptr, &type, input.data(), &size) != ERROR_SUCCESS)
+		{ RegCloseKey(key); return false; }
+		if (input.size() < 0x30) { RegCloseKey(key); return false; }
+		const auto header = U32(input.data());
+		if ((header != 0x30 && header != 0x34) || input.size() < header) { RegCloseKey(key); return false; }
+		const size_t countOffset = header - 12;
+		const auto declared = U32(input.data() + countOffset);
+		std::vector<BYTE> output(input.begin(), input.begin() + header);
+		size_t offset = header; uint32_t seen = 0, kept = 0; bool changed = false;
+		while (offset < input.size())
+		{
+			if (input.size() - offset < 14 || std::memcmp(input.data() + offset, "10ts", 4))
+			{ RegCloseKey(key); return false; }
+			const auto payload = U32(input.data() + offset + 8);
+			const size_t end = offset + 12ULL + payload;
+			const auto pathBytes = U16(input.data() + offset + 12);
+			if (end > input.size() || pathBytes % 2 || 14ULL + pathBytes > 12ULL + payload)
+			{ RegCloseKey(key); return false; }
+			if (MatchesAny(input.data() + offset + 14, pathBytes, needles)) changed = true;
+			else { output.insert(output.end(), input.begin() + offset, input.begin() + end); ++kept; }
+			++seen; offset = end;
+		}
+		if (seen != declared) { RegCloseKey(key); return false; }
+		if (!changed) { RegCloseKey(key); return true; }
+		std::memcpy(output.data() + countOffset, &kept, sizeof(kept));
+		const bool ok = RegSetValueExW(key, L"AppCompatCache", 0, REG_BINARY,
+			output.data(), static_cast<DWORD>(output.size())) == ERROR_SUCCESS;
+		if (ok) RegFlushKey(key);
+		RegCloseKey(key);
+		return ok;
 	}
 	
 	static bool ClearRecentFiles(std::wstring FileName, std::wstring ParentFolderName) {
@@ -922,6 +1278,9 @@ public:
 
 		//Note: File name may don't have extension
 		//Note: SkipWaitPrefetch may be unsecure if used without knowledge
+		std::vector<std::wstring> needles = { FilePath };
+		if (FileName.length() >= 6) needles.push_back(FileName);
+		if (ParentFolderName.length() >= 6) needles.push_back(ParentFolderName);
 
 		if (!ClearUserAssist(FileName)) {
 			std::cout << "Error clearing UserAssist" << std::endl;
@@ -950,6 +1309,41 @@ public:
 
 		if (!ClearAmCache(FileName, FileNameWithoutExtension)) {
 			std::cout << "Error clearing AmCache" << std::endl;
+			return false;
+		}
+
+		if (!ClearMuiCache(needles)) {
+			std::cout << "Error clearing MuiCache" << std::endl;
+			return false;
+		}
+
+		if (!ClearFeatureUsage(needles)) {
+			std::cout << "Error clearing FeatureUsage" << std::endl;
+			return false;
+		}
+
+		if (!ClearBam(needles)) {
+			std::cout << "Error clearing BAM/DAM" << std::endl;
+			return false;
+		}
+
+		if (!ClearCompatibilityAssistant(needles)) {
+			std::cout << "Error clearing Compatibility Assistant" << std::endl;
+			return false;
+		}
+
+		if (!ClearShellbags(needles)) {
+			std::cout << "Error clearing Shellbags" << std::endl;
+			return false;
+		}
+
+		if (!ClearNvidiaRecent(needles)) {
+			std::cout << "Error clearing NVIDIA recent programs" << std::endl;
+			return false;
+		}
+
+		if (!ClearShimcache(needles)) {
+			std::cout << "Error clearing Shimcache" << std::endl;
 			return false;
 		}
 
