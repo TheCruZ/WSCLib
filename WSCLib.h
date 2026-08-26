@@ -17,6 +17,7 @@ This header is focused in forensic cleaning of execution traces of an applicatio
 #include <filesystem>
 #include <fstream>
 #include <Subauth.h>
+#include <Aclapi.h>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -142,6 +143,13 @@ private:
 			return (HKEY)INVALID_HANDLE_VALUE;
 		}
 		return hKeyResult;
+	}
+
+	static HKEY OpenKeyWithAccess(HKEY hKey, const std::wstring& SubKey, REGSAM Access)
+	{
+		HKEY result = nullptr;
+		return RegOpenKeyExW(hKey, SubKey.c_str(), 0, Access, &result) == ERROR_SUCCESS
+			? result : (HKEY)INVALID_HANDLE_VALUE;
 	}
 
 	struct ValueInfo {
@@ -478,6 +486,100 @@ private:
 		return true;
 	}
 
+	class TemporarySetValueAcl
+	{
+		HKEY Key = nullptr;
+		PSECURITY_DESCRIPTOR Descriptor = nullptr;
+		PACL OriginalDacl = nullptr;
+		PACL TemporaryDacl = nullptr;
+
+	public:
+		TemporarySetValueAcl() = default;
+		TemporarySetValueAcl(const TemporarySetValueAcl&) = delete;
+		TemporarySetValueAcl& operator=(const TemporarySetValueAcl&) = delete;
+
+		bool Grant(HKEY root, const std::wstring& path)
+		{
+			if (RegOpenKeyExW(root, path.c_str(), 0, READ_CONTROL | WRITE_DAC, &Key) != ERROR_SUCCESS)
+				return false;
+
+			if (GetSecurityInfo(Key, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+				nullptr, nullptr, &OriginalDacl, nullptr, &Descriptor) != ERROR_SUCCESS ||
+				!Descriptor || !OriginalDacl)
+			{
+				Reset(false);
+				return false;
+			}
+
+			BYTE administratorsSid[SECURITY_MAX_SID_SIZE]{};
+			DWORD sidSize = sizeof(administratorsSid);
+			if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr,
+				administratorsSid, &sidSize))
+			{
+				Reset(false);
+				return false;
+			}
+
+			EXPLICIT_ACCESSW access{};
+			access.grfAccessPermissions = KEY_SET_VALUE;
+			access.grfAccessMode = GRANT_ACCESS;
+			access.grfInheritance = NO_INHERITANCE;
+			access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+			access.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+			access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(administratorsSid);
+			if (SetEntriesInAclW(1, &access, OriginalDacl, &TemporaryDacl) != ERROR_SUCCESS ||
+				!TemporaryDacl || SetSecurityInfo(Key, SE_REGISTRY_KEY,
+					DACL_SECURITY_INFORMATION, nullptr, nullptr, TemporaryDacl, nullptr) != ERROR_SUCCESS)
+			{
+				Reset(false);
+				return false;
+			}
+			return true;
+		}
+
+		~TemporarySetValueAcl() { Reset(true); }
+
+	private:
+		void Reset(bool restore)
+		{
+			if (restore && Key && OriginalDacl)
+				SetSecurityInfo(Key, SE_REGISTRY_KEY, DACL_SECURITY_INFORMATION,
+					nullptr, nullptr, OriginalDacl, nullptr);
+			if (TemporaryDacl) LocalFree(TemporaryDacl);
+			if (Descriptor) LocalFree(Descriptor);
+			if (Key) RegCloseKey(Key);
+			Key = nullptr;
+			Descriptor = nullptr;
+			OriginalDacl = nullptr;
+			TemporaryDacl = nullptr;
+		}
+	};
+
+	static bool ClearBamSid(HKEY root, const std::wstring& path,
+		const std::vector<std::wstring>& needles)
+	{
+		auto key = OpenKeyWithAccess(root, path, KEY_QUERY_VALUE | KEY_SET_VALUE);
+		std::unique_ptr<TemporarySetValueAcl> temporaryAcl;
+		if (key == INVALID_HANDLE_VALUE)
+		{
+			temporaryAcl = std::make_unique<TemporarySetValueAcl>();
+			if (!temporaryAcl->Grant(root, path)) return false;
+			key = OpenKeyWithAccess(root, path, KEY_QUERY_VALUE | KEY_SET_VALUE);
+			if (key == INVALID_HANDLE_VALUE) return false;
+		}
+		for (const auto& value : GetValueList(key))
+		{
+			if (MatchesAny(value.Name, needles) &&
+				RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+			{
+				RegCloseKey(key);
+				return false;
+			}
+		}
+		RegCloseKey(key);
+		return true;
+	}
+
 	static bool ClearBam(const std::vector<std::wstring>& needles)
 	{
 		const std::vector<std::wstring> roots = {
@@ -487,21 +589,15 @@ private:
 			L"SYSTEM\\CurrentControlSet\\Services\\dam\\UserSettings" };
 		for (const auto& path : roots)
 		{
-			auto root = OpenKey(HKEY_LOCAL_MACHINE, path);
+			auto root = OpenKeyWithAccess(HKEY_LOCAL_MACHINE, path, KEY_READ);
 			if (root == INVALID_HANDLE_VALUE) continue;
 			for (const auto& sid : GetSubKeys(root))
 			{
-				auto key = OpenKey(root, sid);
-				if (key == INVALID_HANDLE_VALUE) continue;
-				for (const auto& value : GetValueList(key))
+				if (!ClearBamSid(HKEY_LOCAL_MACHINE, path + L"\\" + sid, needles))
 				{
-					if (MatchesAny(value.Name, needles) &&
-						RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
-					{
-						RegCloseKey(key); RegCloseKey(root); return false;
-					}
+					RegCloseKey(root);
+					return false;
 				}
-				RegCloseKey(key);
 			}
 			RegCloseKey(root);
 		}
@@ -690,10 +786,11 @@ private:
 		if (input.size() < 0x30) { RegCloseKey(key); return false; }
 		const auto header = U32(input.data());
 		if ((header != 0x30 && header != 0x34) || input.size() < header) { RegCloseKey(key); return false; }
-		const size_t countOffset = header - 12;
-		const auto declared = U32(input.data() + countOffset);
+		// The DWORD at header - 12 is not a reliable live-record count on
+		// current Windows 11 builds. Preserve the complete header byte-for-byte
+		// and validate consecutive 10ts records until the end of the blob.
 		std::vector<BYTE> output(input.begin(), input.begin() + header);
-		size_t offset = header; uint32_t seen = 0, kept = 0; bool changed = false;
+		size_t offset = header; bool changed = false;
 		while (offset < input.size())
 		{
 			if (input.size() - offset < 14 || std::memcmp(input.data() + offset, "10ts", 4))
@@ -704,17 +801,41 @@ private:
 			if (end > input.size() || pathBytes % 2 || 14ULL + pathBytes > 12ULL + payload)
 			{ RegCloseKey(key); return false; }
 			if (MatchesAny(input.data() + offset + 14, pathBytes, needles)) changed = true;
-			else { output.insert(output.end(), input.begin() + offset, input.begin() + end); ++kept; }
-			++seen; offset = end;
+			else output.insert(output.end(), input.begin() + offset, input.begin() + end);
+			offset = end;
 		}
-		if (seen != declared) { RegCloseKey(key); return false; }
 		if (!changed) { RegCloseKey(key); return true; }
-		std::memcpy(output.data() + countOffset, &kept, sizeof(kept));
 		const bool ok = RegSetValueExW(key, L"AppCompatCache", 0, REG_BINARY,
 			output.data(), static_cast<DWORD>(output.size())) == ERROR_SUCCESS;
 		if (ok) RegFlushKey(key);
 		RegCloseKey(key);
 		return ok;
+	}
+
+	static bool ClearWer(const std::vector<std::wstring>& needles)
+	{
+		for (const auto variable : { L"LOCALAPPDATA", L"ProgramData" })
+		{
+			wchar_t base[MAX_PATH]{};
+			const auto length = GetEnvironmentVariableW(variable, base, MAX_PATH);
+			if (!length || length >= MAX_PATH) continue;
+			const auto root = std::filesystem::path(base) /
+				L"Microsoft" / L"Windows" / L"WER";
+			for (const auto reportRoot : { L"ReportQueue", L"ReportArchive", L"ReportStore" })
+			{
+				const auto directory = root / reportRoot;
+				std::error_code error;
+				std::filesystem::directory_iterator entries(directory, error);
+				if (error) continue;
+				for (const auto& entry : entries)
+				{
+					if (!MatchesAny(entry.path().filename().wstring(), needles)) continue;
+					std::filesystem::remove_all(entry.path(), error);
+					if (error) return false;
+				}
+			}
+		}
+		return true;
 	}
 	
 	static bool ClearRecentFiles(std::wstring FileName, std::wstring ParentFolderName) {
@@ -1377,6 +1498,11 @@ public:
 
 		if (!ClearShimcache(needles)) {
 			std::cout << "Error clearing Shimcache" << std::endl;
+			return false;
+		}
+
+		if (!ClearWer(needles)) {
+			std::cout << "Error clearing Windows Error Reporting" << std::endl;
 			return false;
 		}
 
