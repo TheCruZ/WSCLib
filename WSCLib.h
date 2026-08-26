@@ -614,6 +614,42 @@ private:
 	static uint16_t U16(const BYTE* p) { uint16_t value; std::memcpy(&value, p, 2); return value; }
 	static uint32_t U32(const BYTE* p) { uint32_t value; std::memcpy(&value, p, 4); return value; }
 
+	struct NvidiaRecentApp
+	{
+		uint16_t Type = 0;
+		std::wstring Identifier;
+		int64_t LastRun = 0;
+	};
+
+	template <typename T>
+	static bool ReadNvidiaField(const std::vector<BYTE>& input, size_t& cursor, T& value)
+	{
+		if (cursor > input.size() || sizeof(value) > input.size() - cursor) return false;
+		std::memcpy(&value, input.data() + cursor, sizeof(value));
+		cursor += sizeof(value);
+		return true;
+	}
+
+	static bool ReadNvidiaRecentApp(const std::vector<BYTE>& input, size_t& cursor,
+		NvidiaRecentApp& app)
+	{
+		uint16_t identifierBytes = 0;
+		if (!ReadNvidiaField(input, cursor, app.Type) ||
+			!ReadNvidiaField(input, cursor, identifierBytes)) return false;
+		if ((app.Type != 1 && app.Type != 2) || identifierBytes < sizeof(wchar_t) ||
+			identifierBytes % sizeof(wchar_t) || cursor > input.size() ||
+			identifierBytes > input.size() - cursor)
+			return false;
+
+		const auto characterCount = identifierBytes / sizeof(wchar_t);
+		app.Identifier.resize(characterCount);
+		std::memcpy(app.Identifier.data(), input.data() + cursor, identifierBytes);
+		cursor += identifierBytes;
+		if (app.Identifier.back() != L'\0') return false;
+		app.Identifier.pop_back();
+		return ReadNvidiaField(input, cursor, app.LastRun);
+	}
+
 	static bool ClearNvidiaRecent(const std::vector<std::wstring>& needles)
 	{
 		const auto programData = Expand(L"%ProgramData%");
@@ -623,20 +659,17 @@ private:
 		if (!ReadBinaryFile(path, input)) return !std::filesystem::exists(path);
 		if (input.size() < 2 || U16(input.data()) != 1) return false;
 		std::vector<BYTE> output(input.begin(), input.begin() + 2);
-		size_t offset = 2; bool changed = false;
-		while (offset < input.size())
+		size_t cursor = 2; bool changed = false;
+		while (cursor < input.size())
 		{
-			if (std::all_of(input.begin() + offset, input.end(), [](BYTE b) { return b == 0; }))
-			{ output.insert(output.end(), input.begin() + offset, input.end()); break; }
-			if (input.size() - offset < 12) return false;
-			const auto type = U16(input.data() + offset);
-			const auto pathBytes = U16(input.data() + offset + 2);
-			if ((type != 1 && type != 2) || pathBytes < 2 || pathBytes % 2) return false;
-			const size_t end = offset + 4ULL + pathBytes + 8ULL;
-			if (end > input.size() || input[offset + 4 + pathBytes - 2] || input[offset + 4 + pathBytes - 1]) return false;
-			if (MatchesAny(input.data() + offset + 4, pathBytes - 2, needles)) changed = true;
-			else output.insert(output.end(), input.begin() + offset, input.begin() + end);
-			offset = end;
+			if (std::all_of(input.begin() + cursor, input.end(), [](BYTE b) { return b == 0; }))
+			{ output.insert(output.end(), input.begin() + cursor, input.end()); break; }
+
+			const auto recordStart = cursor;
+			NvidiaRecentApp app;
+			if (!ReadNvidiaRecentApp(input, cursor, app)) return false;
+			if (MatchesAny(app.Identifier, needles)) changed = true;
+			else output.insert(output.end(), input.begin() + recordStart, input.begin() + cursor);
 		}
 		if (!changed) return true;
 		output.resize(input.size(), 0);
