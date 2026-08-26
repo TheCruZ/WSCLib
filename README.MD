@@ -12,14 +12,22 @@ This library is a single include header to clear recent execution traces
 - Prefetch
 - USNJournal (Just full deletion, not arbitrary files)
 - Amcache
+- System BAM/DAM
+- MuiCache
+- Explorer FeatureUsage
+- Compatibility Assistant (registry and PCA launch dictionaries)
+- Shellbags (matching BagMRU branch only)
+- NVIDIA recent programs (`nvAppTimestamps`)
+- Shimcache (Windows 10/11 `10ts` entries)
 
 ### TODO
 
 - SRUM contains exeuction traces and network traces of the app
-- Shellbags find parent folder name
-- NVIDIA recent program run
-- System bam service
-- Mui Cache
-- Explorer FeatureUsage
-- Compatibility Assistant
-- Shimcache
+
+SRUM remains pending because its live `SRUDB.dat` is a service-owned ESE
+database. Deleting the database or stopping diagnostics and editing it without
+a transaction-safe, version-independent schema would remove unrelated system
+history and can leave the database dirty.
+
+The new cleaners are selective: unknown binary formats fail without writing,
+and unrelated registry values, NVIDIA records and Shimcache entries are kept.
