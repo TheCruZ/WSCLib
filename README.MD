@@ -19,6 +19,7 @@ This library is a single include header to clear recent execution traces
 - Shellbags (matching BagMRU branch only)
 - NVIDIA recent programs (`nvAppTimestamps`)
 - Shimcache (Windows 10/11 `10ts` entries)
+- Windows Error Reporting (`ReportQueue`, `ReportArchive`, `ReportStore`)
 
 ### TODO
 
