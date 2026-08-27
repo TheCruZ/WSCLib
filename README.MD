@@ -7,6 +7,10 @@ This library is a single include header to clear recent execution traces
 - UserAssist
 - RecentFiles
 - RunMRU
+- TypedPaths (Explorer address bar, repairing its `MRUList` order)
+- Common dialogs MRU (`OpenSavePidlMRU`/`LastVisitedPidlMRU`, repairing
+  `MRUListEx`; own-app subkeys removed whole, foreign subkeys keep unrelated
+  entries)
 - Automatic/CustomDestinations
 - RecentDocs
 - Prefetch
