@@ -707,6 +707,113 @@ private:
 		return true;
 	}
 
+	// TypedPaths: paths typed into the Explorer address bar. Values are
+	// Path1..Path26 (REG_SZ with the path); the order lives in the MRUList
+	// REG_SZ, where PathN maps to the N-th letter. Only matching PathN
+	// values are removed and their letter is repaired out of MRUList.
+	static bool RemoveMruListLetter(HKEY key, wchar_t letter)
+	{
+		DWORD type = 0, size = 0;
+		if (RegQueryValueExW(key, L"MRUList", nullptr, &type, nullptr, &size) != ERROR_SUCCESS)
+			return true;
+		if (type != REG_SZ || size < sizeof(wchar_t)) return false;
+		std::wstring list(size / sizeof(wchar_t), L'\0');
+		if (RegQueryValueExW(key, L"MRUList", nullptr, &type,
+			reinterpret_cast<BYTE*>(list.data()), &size) != ERROR_SUCCESS)
+			return false;
+		list.resize(size / sizeof(wchar_t));
+		std::wstring filtered;
+		for (const wchar_t c : list)
+			if (c != L'\0' && c != letter && c != std::towlower(letter) && c != std::towupper(letter))
+				filtered.push_back(c);
+		filtered.push_back(L'\0');
+		return RegSetValueExW(key, L"MRUList", 0, REG_SZ,
+			reinterpret_cast<const BYTE*>(filtered.c_str()),
+			static_cast<DWORD>(filtered.size() * sizeof(wchar_t))) == ERROR_SUCCESS;
+	}
+
+	static bool ClearTypedPaths(const std::vector<std::wstring>& needles)
+	{
+		auto key = OpenKey(HKEY_CURRENT_USER,
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths");
+		if (key == INVALID_HANDLE_VALUE) return true;
+		for (const auto& value : GetValueList(key))
+		{
+			if (value.Name.rfind(L"Path", 0) != 0) continue;
+			wchar_t* end = nullptr;
+			const auto index = wcstoul(value.Name.c_str() + 4, &end, 10);
+			if (!end || *end != 0 || index == 0) continue;
+			if (!MatchesAny(value.Data.data(), value.Data.size(), needles)) continue;
+			if (RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+			{
+				RegCloseKey(key);
+				return false;
+			}
+			if (!RemoveMruListLetter(key, wchar_t(L'a' + (index - 1) % 26)))
+			{
+				RegCloseKey(key);
+				return false;
+			}
+		}
+		RegCloseKey(key);
+		return true;
+	}
+
+	// Common dialog MRUs: OpenSavePidlMRU keeps the last files chosen through
+	// GetOpenFileName/GetSaveFileName per executable, and LastVisitedPidlMRU
+	// the last folder per executable. Values are MRUItemN blobs (pidl with the
+	// path embedded as UTF-16) ordered by MRUListEx. A subkey named like one
+	// of the needles belongs to the application and goes away whole; foreign
+	// subkeys only lose the matching MRUItemN values, repairing MRUListEx.
+	static bool ClearCommonDialogsMruKey(HKEY root, const std::vector<std::wstring>& needles)
+	{
+		for (const auto& child : GetSubKeys(root))
+		{
+			if (MatchesAny(child, needles))
+			{
+				if (RegDeleteTreeW(root, child.c_str()) != ERROR_SUCCESS) return false;
+				continue;
+			}
+			auto key = OpenKey(root, child);
+			if (key == INVALID_HANDLE_VALUE) continue;
+			for (const auto& value : GetValueList(key))
+			{
+				if (value.Name.rfind(L"MRUItem", 0) != 0) continue;
+				wchar_t* end = nullptr;
+				const auto index = wcstoul(value.Name.c_str() + 7, &end, 10);
+				if (!end || *end != 0) continue;
+				if (!MatchesAny(value.Data.data(), value.Data.size(), needles)) continue;
+				if (RegDeleteValueW(key, value.Name.c_str()) != ERROR_SUCCESS)
+				{
+					RegCloseKey(key);
+					return false;
+				}
+				if (!RemoveMruIndex(key, index))
+				{
+					RegCloseKey(key);
+					return false;
+				}
+			}
+			RegCloseKey(key);
+		}
+		return true;
+	}
+
+	static bool ClearCommonDialogsMru(const std::vector<std::wstring>& needles)
+	{
+		for (const auto& path : {
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\OpenSavePidlMRU",
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ComDlg32\\LastVisitedPidlMRU" })
+		{
+			auto root = OpenKey(HKEY_CURRENT_USER, path);
+			if (root == INVALID_HANDLE_VALUE) continue;
+			const bool ok = ClearCommonDialogsMruKey(root, needles);
+			RegCloseKey(root);
+			if (!ok) return false;
+		}
+		return true;
+	}
+
 	static uint16_t U16(const BYTE* p) { uint16_t value; std::memcpy(&value, p, 2); return value; }
 	static uint32_t U32(const BYTE* p) { uint32_t value; std::memcpy(&value, p, 4); return value; }
 
@@ -1448,6 +1555,16 @@ public:
 
 		if (!ClearRunMRU(FileName)) {
 			std::cout << "Error clearing RunMRU" << std::endl;
+			return false;
+		}
+
+		if (!ClearTypedPaths(needles)) {
+			std::cout << "Error clearing TypedPaths" << std::endl;
+			return false;
+		}
+
+		if (!ClearCommonDialogsMru(needles)) {
+			std::cout << "Error clearing common dialogs MRU" << std::endl;
 			return false;
 		}
 
